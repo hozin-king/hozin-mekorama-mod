@@ -92,14 +92,25 @@ jobs:
       - name: Build dex menu -> smali
         run: |
           AJAR="$ANDROID_HOME/platforms/${PLATFORM}/android.jar"
-          mkdir -p /tmp/menu-classes /tmp/menu-dex /tmp/menu-smali
+          BT="$ANDROID_HOME/build-tools/${BUILD_TOOLS}"
+          mkdir -p /tmp/menu-classes /tmp/menu-dex /tmp/mini
           javac -encoding UTF-8 -proc:none -cp "$AJAR" -d /tmp/menu-classes \
             $(find menu-src -name '*.java')
-          "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/d8" \
-            --lib "$AJAR" --output /tmp/menu-dex \
+          "$BT/d8" --lib "$AJAR" --output /tmp/menu-dex \
             $(find /tmp/menu-classes -name '*.class')
-          java -cp /tmp/apktool.jar org.jf.baksmali.Main disassemble \
-            /tmp/menu-dex/classes.dex -o /tmp/menu-smali
+          # dex -> smali lewat APK mini + apktool decode (baksmali di dalam
+          # jar apktool 2.10 tidak punya main class yang bisa dijalankan)
+          cat > /tmp/mini/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.hozinking.mekomod">
+              <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="33"/>
+              <application android:label="mekomod"/>
+          </manifest>
+          EOF
+          "$BT/aapt2" link -o /tmp/mini.apk -I "$AJAR" --manifest /tmp/mini/AndroidManifest.xml
+          (cd /tmp && zip -j mini.apk menu-dex/classes.dex > /dev/null)
+          java -jar /tmp/apktool.jar d -f /tmp/mini.apk -o /tmp/mini-dec
+          cp -r /tmp/mini-dec/smali /tmp/menu-smali
           test -f /tmp/menu-smali/com/hozinking/mekomod/Menu.smali
 
       - name: Rakit APK mod (decode, patch, injeksi, build)
