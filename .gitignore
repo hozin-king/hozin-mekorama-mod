@@ -1,0 +1,15 @@
+# Rahasia & signing — TIDAK PERNAH ter-commit
+*.jks
+*.keystore
+*.key
+SECRETS*
+*.local.txt
+
+# APK dasar bentuk asli (yang ter-commit hanya salinan terenkripsi .enc)
+base/*.apk
+
+# Artefak build lokal
+build/
+*.apk
+*.idsig
+/tmp/

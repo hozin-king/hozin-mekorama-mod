@@ -1,0 +1,164 @@
+name: Build Hozin Mekorama Mod
+
+# Build APK mod Mekorama (mod menu non-root) HANYA di GitHub Actions.
+# Alur: dekripsi APK dasar (file terenkripsi di base/, kunci di Secrets)
+# -> uji host SaveEditor -> build payload native (2 ABI) -> build dex menu
+# -> apktool decode + patch smali + injeksi -> zipalign + signing
+# (keystore proyek dari Secrets) -> verifikasi -> artifact / Release.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  APKTOOL_VERSION: '2.10.0'
+  NDK_VERSION: '25.2.9519653'
+  BUILD_TOOLS: '34.0.0'
+  PLATFORM: 'android-33'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Tentukan versi
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=v1.0-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Android SDK packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;${NDK_VERSION}" "cmake;3.22.1" \
+            "platforms;${PLATFORM}" "build-tools;${BUILD_TOOLS}"
+
+      - name: Dekripsi APK dasar & verifikasi SHA-256
+        env:
+          MEKOMOD_BASE_APK_KEY: ${{ secrets.MEKOMOD_BASE_APK_KEY }}
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 \
+            -in base/mekorama-1.7.2.apk.enc -out /tmp/base.apk \
+            -pass env:MEKOMOD_BASE_APK_KEY
+          EXPECTED=$(tr -d ' \n' < base/base.sha256.txt)
+          ACTUAL=$(sha256sum /tmp/base.apk | cut -d' ' -f1)
+          echo "SHA-256 APK dasar: $ACTUAL"
+          test "$EXPECTED" = "$ACTUAL" || { echo "SHA-256 TIDAK COCOK"; exit 1; }
+
+      - name: Uji host SaveEditor (logika unlock save)
+        run: |
+          mkdir -p /tmp/basefiles /tmp/test-classes
+          unzip -o -q /tmp/base.apk 'assets/db' 'assets/level_infos.json' -d /tmp/basefiles
+          javac -encoding UTF-8 -proc:none -d /tmp/test-classes \
+            menu-src/com/hozinking/mekomod/SaveEditor.java \
+            test/com/hozinking/mekomod/SaveEditorTest.java
+          java -cp /tmp/test-classes com.hozinking.mekomod.SaveEditorTest \
+            /tmp/basefiles/assets/db /tmp/basefiles/assets/level_infos.json
+
+      - name: Build payload native (arm64-v8a + armeabi-v7a)
+        run: |
+          NDK="$ANDROID_HOME/ndk/${NDK_VERSION}"
+          for ABI in arm64-v8a armeabi-v7a; do
+            cmake -S native -B "/tmp/native-$ABI" \
+              -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+              -DANDROID_ABI="$ABI" -DANDROID_PLATFORM=android-21 \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build "/tmp/native-$ABI" -j
+          done
+
+      - name: Unduh apktool
+        run: |
+          curl -sL -o /tmp/apktool.jar \
+            "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar"
+          java -jar /tmp/apktool.jar --version
+
+      - name: Build dex menu -> smali
+        run: |
+          AJAR="$ANDROID_HOME/platforms/${PLATFORM}/android.jar"
+          mkdir -p /tmp/menu-classes /tmp/menu-dex /tmp/menu-smali
+          javac -encoding UTF-8 -proc:none -cp "$AJAR" -d /tmp/menu-classes \
+            $(find menu-src -name '*.java')
+          "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/d8" \
+            --lib "$AJAR" --output /tmp/menu-dex \
+            $(find /tmp/menu-classes -name '*.class')
+          java -cp /tmp/apktool.jar org.jf.baksmali.Main disassemble \
+            /tmp/menu-dex/classes.dex -o /tmp/menu-smali
+          test -f /tmp/menu-smali/com/hozinking/mekomod/Menu.smali
+
+      - name: Rakit APK mod (decode, patch, injeksi, build)
+        run: |
+          java -jar /tmp/apktool.jar d -f /tmp/base.apk -o /tmp/dec
+          python3 tools/patch_smali.py /tmp/dec
+          cp -r /tmp/menu-smali /tmp/dec/smali_classes3
+          cp /tmp/native-arm64-v8a/libmekomod.so /tmp/dec/lib/arm64-v8a/
+          cp /tmp/native-armeabi-v7a/libmekomod.so /tmp/dec/lib/armeabi-v7a/
+          java -jar /tmp/apktool.jar b /tmp/dec -o /tmp/mod-unsigned.apk
+
+      - name: Zipalign + signing (keystore proyek dari Secrets)
+        env:
+          KEYSTORE_B64: ${{ secrets.MEKOMOD_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.MEKOMOD_KS_PASS }}
+          KEY_ALIAS: ${{ secrets.MEKOMOD_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.MEKOMOD_KEY_PASS }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          echo "$KEYSTORE_B64" | base64 -d > /tmp/mekomod.jks
+          BT="$ANDROID_HOME/build-tools/${BUILD_TOOLS}"
+          "$BT/zipalign" -p 4 /tmp/mod-unsigned.apk /tmp/mod-aligned.apk
+          "$BT/apksigner" sign \
+            --ks /tmp/mekomod.jks --ks-pass "pass:$KS_PASS" \
+            --ks-key-alias "$KEY_ALIAS" --key-pass "pass:$KEY_PASS" \
+            --out "HozinMekoramaMod-${VERSION}.apk" /tmp/mod-aligned.apk
+          "$BT/apksigner" verify --print-certs "HozinMekoramaMod-${VERSION}.apk"
+
+      - name: Verifikasi isi APK mod
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          APK="HozinMekoramaMod-${VERSION}.apk"
+          unzip -l "$APK" | grep -E 'classes3\.dex' 
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/libmekomod\.so'
+          unzip -l "$APK" | grep -E 'lib/armeabi-v7a/libmekomod\.so'
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/libmekorama\.so'
+          mkdir -p /tmp/dexcheck && cd /tmp/dexcheck && unzip -o -q "$GITHUB_WORKSPACE/$APK" classes3.dex
+          "$ANDROID_HOME/build-tools/${BUILD_TOOLS}/dexdump" classes3.dex | grep -m1 'Lcom/hozinking/mekomod/Menu;'
+          ls -la "$GITHUB_WORKSPACE/$APK"
+          sha256sum "$GITHUB_WORKSPACE/$APK"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HozinMekoramaMod-${{ steps.ver.outputs.version }}
+          path: HozinMekoramaMod-${{ steps.ver.outputs.version }}.apk
+
+      - name: Buat / perbarui GitHub Release (khusus tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          APK="HozinMekoramaMod-${VERSION}.apk"
+          if gh release view "$VERSION" > /dev/null 2>&1; then
+            gh release upload "$VERSION" "$APK" --clobber
+          else
+            gh release create "$VERSION" "$APK" \
+              --title "Hozin Mekorama Mod ${VERSION} — untuk Mekorama 1.7.2" \
+              --notes-file RELEASE_NOTES.md
+          fi
