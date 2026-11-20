@@ -89,4 +89,31 @@ public final class NativeBridge {
 
     /** Path lengkap sandbox game untuk sebuah nama file, null bila gagal. */
     public static native String nativeSandboxPath(String fileName);
+
+    // ------------------------------------------------------------------
+    // Auto Play v1.2 — geser blok (drag/slider) + putar kamera.
+    // Semua HARUS dipanggil dari UI thread game (AutoPlay menjaminnya),
+    // karena voxel_add / voxel_remove / camera_mod_yaw menyentuh state
+    // engine yang juga dipakai game loop.
+    // ------------------------------------------------------------------
+
+    /** Salinan byte rot voxel level aktif (4096 byte), null bila belum init. */
+    public static native byte[] nativeGetVoxelRots();
+
+    /**
+     * Pindahkan satu blok dari sel asal ke sel tujuan lewat fungsi game
+     * sendiri (voxel_remove + voxel_add) — dipakai Auto Play untuk
+     * geser slider / drag. Slider: rel di sel asal dipulihkan.
+     * Mengembalikan 0 bila ok, < 0 bila gagal (simbol tidak ada /
+     * sel kosong / verifikasi gagal).
+     */
+    public static native int nativeMoveBlock(int fromCell, int toCell);
+
+    /**
+     * Putar kamera game 90 derajat (arah +1 / -1) lewat target yaw
+     * milik game — camera_step menganimasikannya dengan halus seperti
+     * swipe pemain, bukan lompat instan. Mengembalikan 0 bila ok,
+     * < 0 bila gagal (simbol tidak ada / payload belum init).
+     */
+    public static native int nativeRotateCamera(int direction);
 }

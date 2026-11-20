@@ -89,6 +89,28 @@ SandboxPathFn g_sandbox_path = nullptr;  // sandbox_path(nama) -> path statis
 int *g_num_levels = nullptr;             // num_levels (jumlah registry level)
 void *g_robot_body = nullptr;            // badan robot Bullet (cache per level)
 
+// ---- v1.2: geser blok (drag/slider) + putar kamera ----
+// voxel_add(pos[3], type, rot, lbl, var) -> 1 ok / 0 gagal; posisi
+// di luar 0..15 memicu geser seluruh level (jangan dipanggil begitu).
+// voxel_remove(pos[3]) -> mengosongkan sel (4 array voxel).
+// Argumen rot: untuk tipe yang byte-5 block_types-nya != 0, rot
+// diacak game (hash); untuk slider (byte-5 = 0) rot yang dilewat
+// dipakai apa adanya — jadi sumbu slider terjaga.
+// camera_yaw_target: camera_step menginterpolasi camera_yaw ke arah
+// target tiap frame (gerakan halus seperti swipe); camera_mod_yaw
+// menormalisasi keduanya ke [0, 2*pi).
+using VoxelAddFn = int (*)(int *, int, int, int, int);
+using VoxelRemoveFn = void (*)(int *);
+using CameraModYawFn = void (*)();
+VoxelAddFn g_voxel_add = nullptr;
+VoxelRemoveFn g_voxel_remove = nullptr;
+CameraModYawFn g_camera_mod_yaw = nullptr;
+uint8_t *g_voxels_rot = nullptr;  // voxels_rot[4096] (byte ekstra bit-0)
+uint8_t *g_voxels_lbl = nullptr;  // voxels_lbl[4096]
+uint8_t *g_voxels_var = nullptr;  // voxels_var[4096] (byte ekstra bit-2)
+float *g_camera_yaw = nullptr;        // camera_yaw
+float *g_camera_yaw_target = nullptr; // camera_yaw_target
+
 int find_lib_cb(dl_phdr_info *info, size_t, void *) {
     if (info->dlpi_name && std::strstr(info->dlpi_name, "libmekorama.so")) {
         g_lib_base = info->dlpi_addr;
@@ -131,10 +153,21 @@ void *init_thread(void *) {
     g_sandbox_write = reinterpret_cast<SandboxWriteFn>(dlsym(h, "sandbox_write"));
     g_sandbox_path = reinterpret_cast<SandboxPathFn>(dlsym(h, "sandbox_path"));
     g_num_levels = reinterpret_cast<int *>(dlsym(h, "num_levels"));
+    // v1.2
+    g_voxel_add = reinterpret_cast<VoxelAddFn>(dlsym(h, "voxel_add"));
+    g_voxel_remove = reinterpret_cast<VoxelRemoveFn>(dlsym(h, "voxel_remove"));
+    g_camera_mod_yaw = reinterpret_cast<CameraModYawFn>(dlsym(h, "camera_mod_yaw"));
+    g_voxels_rot = reinterpret_cast<uint8_t *>(dlsym(h, "voxels_rot"));
+    g_voxels_lbl = reinterpret_cast<uint8_t *>(dlsym(h, "voxels_lbl"));
+    g_voxels_var = reinterpret_cast<uint8_t *>(dlsym(h, "voxels_var"));
+    g_camera_yaw = reinterpret_cast<float *>(dlsym(h, "camera_yaw"));
+    g_camera_yaw_target = reinterpret_cast<float *>(dlsym(h, "camera_yaw_target"));
 
     g_status = fmt("Payload aktif. lib base=0x%lx | db_worlds:%s voxels:%s "
                    "world_min/max:%s cheatflag:%s | figure_tap:%s voxel_load:%s "
-                   "level_get:%s sandbox_write:%s sandbox_path:%s num_levels:%s",
+                   "level_get:%s sandbox_write:%s sandbox_path:%s num_levels:%s "
+                   "| voxel_add:%s voxel_remove:%s camera_mod_yaw:%s voxels_rot:%s "
+                   "camera_yaw:%s",
                    (unsigned long)g_lib_base,
                    g_db_worlds ? "OK" : "TIDAK ADA",
                    g_voxels ? "OK" : "TIDAK ADA",
@@ -145,7 +178,12 @@ void *init_thread(void *) {
                    g_level_get ? "OK" : "TIDAK ADA",
                    g_sandbox_write ? "OK" : "TIDAK ADA",
                    g_sandbox_path ? "OK" : "TIDAK ADA",
-                   g_num_levels ? "OK" : "TIDAK ADA");
+                   g_num_levels ? "OK" : "TIDAK ADA",
+                   g_voxel_add ? "OK" : "TIDAK ADA",
+                   g_voxel_remove ? "OK" : "TIDAK ADA",
+                   g_camera_mod_yaw ? "OK" : "TIDAK ADA",
+                   g_voxels_rot ? "OK" : "TIDAK ADA",
+                   (g_camera_yaw && g_camera_yaw_target) ? "OK" : "TIDAK ADA");
     LOGI("%s", g_status.c_str());
     g_init_done = true;
     return nullptr;
@@ -455,6 +493,58 @@ int do_write_world(const char *file_name, const uint8_t *data, int len) {
     return 0;
 }
 
+// ---- v1.2: geser blok + putar kamera ----
+
+// Pindahkan satu blok dari sel asal ke sel tujuan lewat fungsi game
+// sendiri (voxel_remove + voxel_add) — voxel + fisika + render ikut
+// diperbarui game (voxel_update / update_dirty_chunks).
+// Slider (tipe 41): sel yang ditinggal dipulihkan jadi RAIL (33),
+// sesuai model solver (rel yang ditinggal slider kembali jadi rel).
+// 0 = ok; <0 = gagal.
+int do_move_block(int from_cell, int to_cell) {
+    if (!g_init_done) return -1;
+    if (!g_voxel_add || !g_voxel_remove || !g_voxels) return -5;
+    if (from_cell < 0 || from_cell >= 4096 || to_cell < 0 || to_cell >= 4096) return -2;
+    if (from_cell == to_cell) return -3;
+    int type = g_voxels[from_cell];
+    if (type == 0) return -4; // sel asal kosong
+    int rot = g_voxels_rot ? g_voxels_rot[from_cell] : 0;
+    int lbl = g_voxels_lbl ? g_voxels_lbl[from_cell] : 0;
+    int var = g_voxels_var ? g_voxels_var[from_cell] : 0;
+    int fx = from_cell % 16, fy = (from_cell / 16) % 16, fz = from_cell / 256;
+    int tx = to_cell % 16, ty = (to_cell / 16) % 16, tz = to_cell / 256;
+    int from_pos[3] = {fx, fy, fz};
+    int to_pos[3] = {tx, ty, tz};
+    g_voxel_remove(from_pos);
+    if (type == 41) {
+        // Slider: pulihkan rel di sel yang ditinggal.
+        g_voxel_add(from_pos, 33, 0, 0, 0);
+    }
+    int rc = g_voxel_add(to_pos, type, rot, lbl, var);
+    if (rc != 1) return -6;
+    // Verifikasi: blok sudah di sel tujuan, sel asal kosong (atau rel).
+    if (g_voxels[to_cell] != type) return -7;
+    if (type == 41) {
+        if (g_voxels[from_cell] != 33) return -8;
+    } else if (g_voxels[from_cell] != 0) {
+        return -8;
+    }
+    return 0;
+}
+
+// Putar kamera 90 derajat (direction +1 / -1) lewat target yaw game.
+// camera_step menganimasikannya dengan halus (interpolasi tiap frame),
+// seperti swipe pemain — bukan lompat instan. 0 = ok; <0 = gagal.
+int do_rotate_camera(int direction) {
+    if (!g_init_done) return -1;
+    if (!g_camera_mod_yaw || !g_camera_yaw_target) return -5;
+    if (direction != 1 && direction != -1) return -2;
+    const float half_pi = 1.57079632679f;
+    *g_camera_yaw_target += direction * half_pi;
+    g_camera_mod_yaw();
+    return 0;
+}
+
 } // namespace
 
 extern "C" {
@@ -591,6 +681,30 @@ Java_com_hozinking_mekomod_NativeBridge_nativeSandboxPath(JNIEnv *env, jclass, j
     // sandbox_path mengembalikan buffer statis — salin segera.
     std::string copy(path);
     return env->NewStringUTF(copy.c_str());
+}
+
+// ---- v1.2: geser blok + putar kamera ----
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_hozinking_mekomod_NativeBridge_nativeGetVoxelRots(JNIEnv *env, jclass) {
+    if (!g_init_done || !g_voxels_rot) return nullptr;
+    jbyteArray out = env->NewByteArray(4096);
+    if (!out) return nullptr;
+    env->SetByteArrayRegion(out, 0, 4096,
+                            reinterpret_cast<const jbyte *>(g_voxels_rot));
+    return out;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_hozinking_mekomod_NativeBridge_nativeMoveBlock(JNIEnv *env, jclass, jint from_cell, jint to_cell) {
+    (void)env;
+    return do_move_block(static_cast<int>(from_cell), static_cast<int>(to_cell));
+}
+
+JNIEXPORT jint JNICALL
+Java_com_hozinking_mekomod_NativeBridge_nativeRotateCamera(JNIEnv *env, jclass, jint direction) {
+    (void)env;
+    return do_rotate_camera(static_cast<int>(direction));
 }
 
 } // extern "C"

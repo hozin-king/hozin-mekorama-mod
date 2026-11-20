@@ -16,21 +16,24 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * AutoPlay — toggle ON/OFF untuk "Auto Play — main sendiri" (v1.1).
+ * AutoPlay — toggle ON/OFF untuk "Auto Play — main sendiri" (v1.2).
  *
- * Saat ON: solve level yang sedang dimainkan (Solver A*), jalankan robot
- * lewat figure_tap milik game (satu tap per waypoint, polling posisi
- * robot tiap ~16 ms — TANPA jeda buatan; robot jalan secepat game),
- * lalu OTOMATIS lanjut ke level berikutnya, terus sampai toggle OFF.
+ * Saat ON: solve level yang sedang dimainkan (Solver A* + perencana
+ * konstruktif untuk geser blok), jalankan robot lewat figure_tap milik
+ * game (satu tap per waypoint, polling posisi robot tiap ~16 ms —
+ * TANPA jeda buatan; robot jalan secepat game), geser blok lewat
+ * voxel_remove + voxel_add milik game, putar kamera 90° bila waypoint
+ * macet + sesekali natural tiap ~10 waypoint, lalu OTOMATIS lanjut ke
+ * level berikutnya, terus sampai toggle OFF.
  *
  * Pengaman (pola yang sama seperti Pool Billiards v1.3): gagal menyusun
  * atau menjalankan rencana 3x berturut-turut -> toggle MATI SENDIRI +
  * alasan jelas di status. Satu level yang tidak bisa di-solve TIDAK
  * di-skip diam-diam: berhenti + auto-off + pesan jujur.
  *
- * Semua panggilan yang menyentuh state engine (tap / load level)
- * dijalankan di UI thread game; pembacaan (grid / posisi robot) dari
- * thread worker ini (read-only, aman).
+ * Semua panggilan yang menyentuh state engine (tap / load level /
+ * geser blok / putar kamera) dijalankan di UI thread game; pembacaan
+ * (grid / posisi robot) dari thread worker ini (read-only, aman).
  */
 public final class AutoPlay {
     private AutoPlay() {}
@@ -140,9 +143,9 @@ public final class AutoPlay {
                 if (!sleepOk(500)) return;
                 continue;
             }
-            // 2) Solve.
+            // 2) Solve (dengan byte rot live — sumbu slider dibaca dari sini).
             long t0 = System.currentTimeMillis();
-            Solver.Result r = Solver.solve(grid);
+            Solver.Result r = Solver.solve(grid, NativeBridge.nativeGetVoxelRots());
             long solveMs = System.currentTimeMillis() - t0;
             if (r.status != Solver.Status.OK) {
                 // Level tidak bisa di-solve: berhenti + auto-off + alasan.
@@ -150,12 +153,19 @@ public final class AutoPlay {
                         + " (dinamika: " + r.dynamics + ").");
                 return;
             }
-            report("Level " + levelNo + " ter-solve (" + r.steps() + " langkah, "
+            int drags = 0;
+            if (r.actions != null) {
+                for (Solver.Step s : r.actions) {
+                    if (s.kind != Solver.Step.Kind.WALK) drags++;
+                }
+            }
+            report("Level " + levelNo + " ter-solve (" + r.steps() + " langkah"
+                    + (drags > 0 ? " + " + drags + " geser blok" : "") + ", "
                     + solveMs + " ms) — robot jalan…");
             // 3) Kenali level saat ini (untuk lanjut ke berikut).
             LevelId current = identify(grid);
-            // 4) Jalankan jalan.
-            if (!executePath(r)) {
+            // 4) Jalankan rencana (jalan + geser blok).
+            if (!executePlan(r)) {
                 if (!on) return; // dimatikan user di tengah jalan
                 if (!strike("robot macet di tengah jalan")) return;
                 if (!sleepOk(500)) return;
@@ -203,11 +213,18 @@ public final class AutoPlay {
     }
 
     // ------------------------------------------------------------------
-    // Eksekusi jalan (tap per waypoint + polling posisi robot)
+    // Eksekusi rencana (v1.2: jalan + geser blok + putar kamera)
     // ------------------------------------------------------------------
 
-    private static boolean executePath(Solver.Result r) {
-        if (r.path == null || r.path.size() < 2 || r.start == null) return false;
+    /**
+     * Jalankan rencana solver: jalan kaki (tap per waypoint + polling
+     * posisi robot) diselingi geser blok (voxel_remove + voxel_add
+     * milik game). Kamera diputar 90° bila waypoint macet (mungkin
+     * tertutup dari sudut ini) + sesekali secara natural tiap ~10
+     * waypoint supaya kelihatan seperti pemain sungguhan.
+     */
+    private static boolean executePlan(Solver.Result r) {
+        if (r.start == null) return false;
         // Kenali badan robot dari sel awal solver (hasilnya dicek lewat
         // polling posisi di bawah — bila null, tap tetap dicoba dan
         // ketidaksampaian akan terdeteksi sebagai macet).
@@ -217,33 +234,90 @@ public final class AutoPlay {
                 NativeBridge.nativeFindRobotBody(startIdx);
             }
         });
-        for (int i = 1; i < r.path.size(); i++) {
-            if (!on) return false;
-            final Solver.Cell wp = r.path.get(i);
-            final int cellIdx = wp.index();
-            // Tap di UI thread (figure_tap menyentuh state engine).
-            Boolean tapOk = runOnUiAndWait(new Runnable() {
-                @Override public void run() {
-                    NativeBridge.nativeTapCell(cellIdx);
-                }
-            });
-            if (tapOk == null) {
-                Log.w(TAG, "tap waypoint " + wp + " gagal dipanggil");
+        // Ubah path jalan-kaki murni jadi daftar aksi jalan.
+        List<Solver.Step> actions = r.actions;
+        if (actions == null) {
+            if (r.path == null || r.path.size() < 2) return false;
+            actions = new ArrayList<Solver.Step>();
+            for (int i = 1; i < r.path.size(); i++) {
+                actions.add(Solver.Step.walk(r.path.get(i)));
             }
-            if (!waitArrival(wp, WAYPOINT_TIMEOUT_MS)) {
-                // Coba sekali lagi (tap ulang), lalu menyerah.
-                runOnUiAndWait(new Runnable() {
+        }
+        int waypoints = 0;
+        int camDir = 1;
+        for (Solver.Step s : actions) {
+            if (!on) return false;
+            if (s.kind == Solver.Step.Kind.WALK) {
+                waypoints++;
+                // Sesekali putar kamera secara natural (tiap ~10 waypoint,
+                // arah selang-seling) — jangan putar-putar tanpa henti.
+                if (waypoints % 10 == 0) {
+                    rotateCamera(camDir);
+                    camDir = -camDir;
+                }
+                if (!tapAndWait(s.to)) {
+                    // Macet — putar kamera 90° (waypoint mungkin tertutup
+                    // struktur dari sudut ini), lalu coba tap sekali lagi.
+                    rotateCamera(1);
+                    if (!tapAndWait(s.to)) {
+                        report("Robot tidak sampai di " + s.to + " — berhenti.");
+                        return false;
+                    }
+                }
+            } else {
+                // Geser blok (drag/slider) lewat fungsi game sendiri.
+                final int fromIdx = s.from.index();
+                final int toIdx = s.to.index();
+                final int[] rc = {-99};
+                Boolean ok = runOnUiAndWait(new Runnable() {
                     @Override public void run() {
-                        NativeBridge.nativeTapCell(cellIdx);
+                        rc[0] = NativeBridge.nativeMoveBlock(fromIdx, toIdx);
                     }
                 });
-                if (!waitArrival(wp, WAYPOINT_TIMEOUT_MS / 2)) {
-                    report("Robot tidak sampai di " + wp + " — berhenti.");
+                if (ok == null || rc[0] != 0) {
+                    report("Gagal geser blok " + s.from + " -> " + s.to
+                            + " (kode " + rc[0] + ") — berhenti.");
+                    return false;
+                }
+                // Verifikasi: blok sudah pindah di grid live.
+                if (!sleepOk(100)) return false;
+                byte[] g = NativeBridge.nativeGetVoxels();
+                if (g == null || (g[toIdx] & 0xFF) != s.type
+                        || (g[fromIdx] & 0xFF) != (s.type == Solver.SLIDER
+                                ? Solver.RAIL : 0)) {
+                    report("Verifikasi geser blok gagal (" + s.from + " -> "
+                            + s.to + ") — berhenti.");
                     return false;
                 }
             }
         }
         return true;
+    }
+
+    /** Tap sel + tunggu robot sampai (sekali coba + sekali ulang). */
+    private static boolean tapAndWait(final Solver.Cell wp) {
+        final int cellIdx = wp.index();
+        runOnUiAndWait(new Runnable() {
+            @Override public void run() {
+                NativeBridge.nativeTapCell(cellIdx);
+            }
+        });
+        if (waitArrival(wp, WAYPOINT_TIMEOUT_MS)) return true;
+        runOnUiAndWait(new Runnable() {
+            @Override public void run() {
+                NativeBridge.nativeTapCell(cellIdx);
+            }
+        });
+        return waitArrival(wp, WAYPOINT_TIMEOUT_MS / 2);
+    }
+
+    /** Putar kamera game 90° (arah +1 / -1) — halus via camera_step. */
+    private static void rotateCamera(final int direction) {
+        runOnUiAndWait(new Runnable() {
+            @Override public void run() {
+                NativeBridge.nativeRotateCamera(direction);
+            }
+        });
     }
 
     /** Tunggu robot sampai di waypoint (toleransi posisi badan robot). */

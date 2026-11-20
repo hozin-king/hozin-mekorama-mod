@@ -1,4 +1,4 @@
-# Catatan Teknis — Hozin Mekorama Mod v1.1
+# Catatan Teknis — Hozin Mekorama Mod v1.2
 
 Dokumen ini merangkum dasar teknis mod: dari mana format save diketahui,
 bagaimana unlock bekerja, dan — yang terpenting — apa dasar fitur Teleport
@@ -125,7 +125,7 @@ kalibrasi v1.2.
    tanda tangan & isi APK (dex menu + kedua payload + lib game utuh).
 8. Tag `v*` memicu pembuatan GitHub Release dengan isi `RELEASE_NOTES.md`.
 
-## 5. Auto Play & Buat World Acak (v1.1)
+## 5. Auto Play & Buat World Acak (v1.2)
 
 ### 5.1 Dasar REA baru
 
@@ -138,45 +138,95 @@ kalibrasi v1.2.
 | `sandbox_write` (0xd1114) | Tulis world ke sandbox game: `sandbox_write(nama, data, len)` — dipakai game sendiri saat scan QR selesai (`w_scanned.bin`). Dipakai untuk world acak. |
 | `sandbox_path` | `sandbox_path(nama)` -> path lengkap sandbox (buffer statis, disalin segera). |
 | `figures` / `player_fi` | Array figur 416 byte; tidak dipakai — posisi robot dibaca dari badan Bullet seperti teleport v1.0. |
+| `voxel_add` (0x14ec94) | `voxel_add(pos[3], type, rot, lbl, var)` -> 1 ok / 0 gagal. Menulis 4 array voxel + `voxel_update` + `update_dirty_chunks` (+ `power_create` bila tipe punya power). Dipakai executor untuk geser blok. Posisi di luar 0..15 memicu geser seluruh level — jangan pernah dipanggil begitu. |
+| `voxel_remove` (0x14ef34) | `voxel_remove(pos[3])` — mengosongkan sel (4 array voxel) + update fisika/render. Dipakai executor untuk geser blok. |
+| `voxels_rot` / `voxels_var` / `voxels_lbl` | Array 4096 byte per sel: byte ekstra bit-0 (rot — sumbu slider), bit-2 (var), label. Dibaca payload untuk sumbu slider live + byte blok saat digeser. |
+| `camera_yaw` / `camera_yaw_target` (0x28110c / 0x281104) | Float yaw kamera + targetnya. `camera_step` (0xdd07c) menginterpolasi yaw ke target tiap frame (gerakan halus). |
+| `camera_mod_yaw` (0xdd5b8) | Normalisasi `camera_yaw` + `camera_yaw_target` ke [0, 2π). Dipanggil executor setelah mengubah target yaw. |
+| `block_slider_dir` (0x1397d8) + tabel `rots_face_nums` (0x9d5c1) | Arah slider dari byte rot: rot 16..23 -> sumbu Y (vertikal); rot genap -> X; rot ganjil -> Z. Dibuktikan dari tabel + korelasi rel di 144 level. |
+| `block_types` (0x2373fc, 68 x 8 byte) | Tabel tipe blok; byte 6 = flag: bit 0 -> +1 byte ekstra (rot), bit 2 -> +1 byte ekstra (var). Dipakai `LevelFormat` (lihat di bawah). |
 
-Format file level (dipakai generator + solver, teruji 144/144 file asli):
-`[header 4 byte: 02 13 0d fc (v2; 12 file lama 01 ...)] [stream zlib]` →
-`[1B pjg judul][judul][1B pjg author][author][4096 byte grid][ekor N byte NOL]`.
-Grid: `x=i%16, y=(i/16)%16 (vertikal), z=i/256`. Ekor bervariasi (16..148
-byte, semua nol) dan diabaikan pembaca game; generator menulis 32 byte nol.
-Tabel 68 tipe blok dipulihkan dari `block_type_names` (0x237620) — lihat
-konstanta di `Solver.java`.
+Format file level — **DIPERBAIKI di v1.2** (REA `read_world_cached`
+0x144678 + `write_world` 0x144388, dibuktikan parse 144/144 file asli
+byte-per-byte; deskripsi v1.1 "grid 4096 + ekor nol" SALAH):
+`[header 4 byte: {versi, 0x13, 0x0d, 0xfc}] [stream zlib]` →
+`[1B pjg judul][judul 1..16][1B pjg author][author]` →
+`[4096 sel, TIAP sel = 1 byte tipe + byte ekstra sesuai flag block_types
+(bit 0 -> +1 byte rot, bit 2 -> +1 byte var)]`. **TIDAK ADA ekor nol** —
+yang dulu dikira "ekor" adalah byte ekstra yang terselip di antara sel.
+Versi header = 1 bila tipe maks ≤ 48, 2 bila ≤ 52, 3 bila > 52
+(dihitung `write_world` dari tipe maks; pembaca menolak versi > 3).
+Pembaca game memvalidasi: magic `13 0d fc`, versi ≤ 3, judul 1..16,
+tipe ≤ 67, byte rot ≤ 23 — gagal satu saja = level TIDAK termuat sama
+sekali (inilah bug world acak v1.1). Grid: `x=i%16, y=(i/16)%16
+(vertikal), z=i/256`. Tabel 68 tipe blok dipulihkan dari
+`block_type_names` (0x237620) — lihat konstanta di `Solver.java`.
 
-### 5.2 Solver (A*, `Solver.java` — murni Java, teruji host)
+### 5.2 Solver (v1.2, `Solver.java` — murni Java, teruji host)
 
-- State = sel kaki robot; gerakan: jalan datar, naik 1 tingkat, jatuh
-  (jalan ke tetangga kosong lalu jatuh ke pijakan walkable pertama; mati
-  bila jatuh ke air / keluar dunia / menabrak blok tak bisa dipijak).
-- Heuristik: jarak Manhattan (|dx|+|dy|+|dz|) — sudah mencakup tinggi.
-  Batas 200.000 node / ~2 detik; "Crash Course" selesai 13 ms (9 langkah),
-  "Flat Path" 2 langkah, seluruh 144 level dalam ~200 ms.
+- **Jalan kaki (v1.1, tidak berubah):** state = sel kaki robot; gerakan:
+  jalan datar, naik 1 tingkat, jatuh (jalan ke tetangga kosong lalu jatuh
+  ke pijakan walkable pertama; mati bila jatuh ke air / keluar dunia /
+  menabrak blok tak bisa dipijak). Heuristik Manhattan (|dx|+|dy|+|dz|).
+  Batas 200.000 node / ~2 detik; "Crash Course" selesai 16 ms (**14
+  langkah** — dulu 9 di grid naive yang salah), "Flat Path" 4 langkah +
+  1 geser.
+- **Geser blok (v1.2):** dua perencana, dipakai berurutan.
+  1. *Perencana konstruktif* (cepat, terarah): ulangi — (a) coba A* jalan
+     kaki saja; (b) bila putus, cari jalur geometris (Dijkstra longgar:
+     pijakan diabaikan, sel harus kosong + kepala bebas, biaya +5 untuk
+     sel tanpa pijakan, dan sel di atas blok padat bukan-pijakan — mis.
+     batu polos tipe 1 — dibuang karena tidak pernah bisa dipijak);
+     (c) berjalan sepanjang jalur geometris selagi bisa dipijak, lalu
+     isi pijakan di bawah sel pertama yang putus dengan satu blok drag
+     (blok tembaga/silinder terdekat; blok harus berhenti tepat di
+     target, bertumpu pada blok padat/lantai). Re-planning tiap iterasi.
+  2. *A* blok-geser* (cadangan, eksponensial): state = (robot + posisi
+     tiap blok geser); aksi jalan (biaya 1), geser slider ±1 sepanjang
+     rel (biaya 3; robot ikut naik bila sedang berdiri di atas slider),
+     drag blok ke sel kosong dekat robot (Chebyshev ≤ 1, biaya 4 +
+     jarak/8) + gravitasi (blok jatuh sampai bertumpu). Prune: drag
+     hanya bila pijakan barunya bersebelahan dengan daerah terjangkau
+     robot; slider jauh dari robot (> Chebyshev 3) tidak digerakkan
+     dulu. Batas sama (200.000 node / ~2 dtk).
+- Slider: sumbu dari byte rot (`sliderAxis`: rot ≥ 16 -> Y, genap -> X,
+  ganjil -> Z); rel = run RAIL berurutan sepanjang sumbu + sel slider;
+  sel yang ditinggal slider kembali jadi RAIL. Drag: target harus
+  kosong, tidak menutupi finish, tidak di kolom robot; blok jatuh
+  (gravitasi) sampai bertumpu pada blok padat / lantai (y=0).
 - Zapper (tesla): fase 1 memblokir sel yang berdekatan dengan tesla; bila
   hanya ada jalan lewat dekat zapper, fase 2 menemukannya tapi status
   HAS_ZAPPER (fail-closed — fase zapper tidak bisa dibaca dari game).
 - Bila jalan buntu, BFS "longgar" (elemen dinamis dianggap tembus)
   menamai penyebab paling mungkin: motor / bola / butuh geser blok.
-- **Hasil terukur pada 144 level bawaan: 38 walk-solvable** (28 dari 90
-  Story). Sisanya butuh geser blok / motor / bola / timing zapper —
-  dilaporkan alasannya, bukan dipaksa. Uji host (`SolverTest`) mengunci
-  angka ini (ambang ≥ 35) + kasus sintetik motor/bola/dinding/tanpa-bot.
+- **Hasil terukur pada 144 level bawaan: 92 solvable** (49 murni jalan
+  kaki + 43 butuh geser blok; v1.1: 38 jalan kaki). Uji host
+  (`SolverTest`) mengunci angka ini (ambang ≥ 85 total, ≥ 45 jalan
+  kaki) + 4 level uji v1.2 ("Ride C Over Sea" HARUS solvable, rencana
+  aksi terverifikasi simulasi independen) + kasus sintetik
+  motor/bola/dinding/tanpa-bot.
 
 ### 5.3 Executor Auto Play (`AutoPlay.java`)
 
-- Toggle ON/OFF; loop: baca grid live → solve → kenali level saat ini
-  (cocokkan grid dengan 144 file bawaan) → jalankan jalan waypoint per
-  waypoint (`figure_tap` di UI thread game + polling posisi robot tiap
-  ~16 ms, tanpa jeda buatan) → sampai goal → tunggu 1,2 dtk (win +
-  bintang tersimpan) → `voxel_load` level berikut (nama diverifikasi
-  dulu lewat `level_get`) → ulangi.
-- Tiap waypoint: timeout 4 dtk, tap ulang sekali, lalu menyerah.
-- Gagal 3x berturut-turut → toggle mati sendiri + alasan. Level yang
+- Switch ON/OFF (saklar Android asli, v1.2); loop: baca grid + rot live
+  → solve (dengan rot live untuk sumbu slider) → kenali level saat ini
+  (cocokkan grid dengan 144 file bawaan) → jalankan rencana aksi
+  (jalan + geser blok) → sampai goal → tunggu 1,2 dtk (win + bintang
+  tersimpan) → `voxel_load` level berikut (nama diverifikasi dulu lewat
+  `level_get`) → ulangi.
+- Jalan: `figure_tap` di UI thread game + polling posisi robot tiap
+  ~16 ms, tanpa jeda buatan. Tiap waypoint: timeout 4 dtk, tap ulang
+  sekali, lalu putar kamera 90° + tap ulang (waypoint mungkin tertutup
+  dari sudut ini), baru menyerah.
+- Geser blok: `nativeMoveBlock` (voxel_remove + voxel_add milik game,
+  di UI thread) + verifikasi grid live (blok sudah di sel tujuan, sel
+  asal kosong / jadi rel untuk slider). Gagal -> berhenti + lapor.
+- Kamera: `nativeRotateCamera` (target yaw ±90°, `camera_mod_yaw`) —
+  `camera_step` menganimasikannya halus. Diputar bila waypoint macet +
+  sesekali natural tiap ~10 waypoint (arah selang-seling).
+- Gagal 3x berturut-turut → saklar mati sendiri + alasan. Level yang
   tidak bisa di-solve → berhenti + auto-off + alasan (tidak di-skip
-  diam-diam). Toggle OFF berhenti total (dicek tiap polling & waypoint).
+  diam-diam). Saklar OFF berhenti total (dicek tiap polling & aksi).
 
 ### 5.4 Buat World Acak (`WorldGen.java` — murni Java, teruji host)
 
@@ -187,17 +237,33 @@ konstanta di `Solver.java`.
 - Setiap world diverifikasi Solver (harus OK, 3..60 langkah); gagal 50x
   → lapor gagal. World murni jalan kaki (tanpa air/zapper/motor/bola)
   supaya Auto Play bisa langsung memainkannya.
+- **Perbaikan v1.2:** `LevelFormat.encode` kini menulis format berselip
+  yang benar (byte ekstra per sel sesuai flag `block_types`, tanpa
+  ekor) — world hasil generate lolos validasi `read_world_cached`
+  (magic/versi/tipe/rot) sehingga game bisa me-load + me-play-nya.
+  Uji host memverifikasi rantai penuh: `gameWouldLoad(binBytes)` +
+  solver OK + 1 bot + 1 win + author "Hozin" + roundtrip identik
+  (20/20 world, seed tetap).
 - Ditulis lewat `sandbox_write` (nama `w_acak_hozin_N.bin`) + verifikasi
   berkas ada dengan ukuran sama; kartu + QR muncul karena game sendiri
   mendaftar file sandbox sebagai kartu level (mekanisme yang sama dengan
   level hasil scan QR). Bila kartu belum muncul, user ketuk "Muat Ulang
   Game" (kill proses, seperti Unlock) — game memindai sandbox saat start.
 
-### 5.5 Batasan yang diketahui (v1.1, dilaporkan apa adanya)
+### 5.5 Batasan yang diketahui (v1.2, dilaporkan apa adanya)
 
-- Auto Play hanya menyelesaikan level jalan-kaki (38/144). Drag
-  (geser blok), motor, bola, dan timing zapper BELUM didukung — solver
-  menamai alasannya dan berhenti.
+- Auto Play menyelesaikan **92/144** level bawaan (49 jalan kaki + 43
+  geser blok). Sisanya butuh mekanisme yang belum dimodelkan — solver
+  menamai alasannya dan berhenti:
+  - **Motor / bola** — gerak motor dan fisika bola belum dimodelkan.
+  - **Kotak dorong (SOKOBAN)** — mekanik dorong beda dari drag.
+  - **Timing zapper (tesla)** — solver menghindari area zapper; bila
+    satu-satunya jalan lewat dekat zapper, ia berhenti.
+  - **Logika / tombol / timer** — level yang butuh urutan tombol/sinyal
+    belum dimodelkan.
+- **Geser slider:** naik slider (robot ikut bergerak bersama slider)
+  dimodelkan solver tapi belum teruji di perangkat. Rel di sel yang
+  ditinggal slider dipulihkan oleh payload (sesuai model solver).
 - Pindah level otomatis memakai urutan `level_infos.json`
   (Story lalu Featured) + verifikasi nama via `level_get`; bila urutan
   registry game berbeda, level berikut yang dimuat tetap level valid

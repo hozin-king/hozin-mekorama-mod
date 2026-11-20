@@ -11,8 +11,10 @@ import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.widget.CompoundButton;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.Switch;
 import android.widget.TextView;
 
 import java.io.File;
@@ -37,13 +39,17 @@ import java.util.Map;
  *  2. Pulihkan Save — salin balik backup di atas.
  *  3. Teleport ke Finish — EKSPERIMENTAL (payload native, menunggu uji
  *     HP). Status hasil ditampilkan apa adanya.
- *  4. Auto Play (v1.1) — TOGGLE ON/OFF: saat ON, solver A* memainkan
- *     level yang sedang dibuka sampai selesai, lalu OTOMATIS lanjut ke
- *     level berikut sampai toggle dimatikan. Gagal 3x berturut-turut ->
- *     toggle mati sendiri + alasan jelas (lihat AutoPlay).
- *  5. Buat World Acak (v1.1) — generator world yang diverifikasi solver,
+ *  4. Auto Play (v1.2) — TOGGLE ON/OFF berupa Switch Android asli
+ *     berlabel "Auto Play": saat ON, solver memainkan level yang
+ *     sedang dibuka sampai selesai (jalan kaki + geser blok drag/slider
+ *     + putar kamera), lalu OTOMATIS lanjut ke level berikut sampai
+ *     toggle dimatikan. Gagal 3x berturut-turut -> toggle mati sendiri
+ *     + alasan jelas (lihat AutoPlay).
+ *  5. Buat World Acak (v1.2) — generator world yang diverifikasi solver,
  *     ditulis ke sandbox game lewat sandbox_write milik game sehingga
- *     muncul sebagai kartu level biasa + QR (lihat WorldGen).
+ *     muncul sebagai kartu level biasa + QR (lihat WorldGen). Format
+ *     file sudah sesuai loader game (byte ekstra interleaved), jadi
+ *     kartunya ter-render + bisa di-play sampai selesai.
  *
  * Semua jalur dibungkus try/catch: menu tidak boleh membuat game crash.
  */
@@ -51,12 +57,14 @@ public final class Menu {
     private Menu() {}
 
     private static final String TAG = "MEKOMOD";
-    public static final String VERSION = "1.1";
+    public static final String VERSION = "1.2";
 
     private static Activity activity;
     private static TextView statusView;
     private static LinearLayout panel;
-    private static Button autoPlayBtn;
+    private static Switch autoPlaySwitch;
+    /** true saat saklar diubah programatik (sinkronisasi state) — jangan picu toggle. */
+    private static boolean switchSyncing = false;
     private static boolean nativeInitCalled = false;
     private static final Handler UI = new Handler(Looper.getMainLooper());
 
@@ -148,11 +156,28 @@ public final class Menu {
         });
         panel.addView(tpBtn);
 
-        autoPlayBtn = menuButton(a, "▶  Auto Play — OFF");
-        autoPlayBtn.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { doAutoPlayToggle(a); }
+        // Saklar Auto Play asli (Switch Android) — posisi saklar
+        // menunjukkan ON/OFF; diteken langsung flip.
+        autoPlaySwitch = new Switch(a);
+        autoPlaySwitch.setText("Auto Play");
+        autoPlaySwitch.setTextColor(Color.WHITE);
+        autoPlaySwitch.setTextSize(13);
+        autoPlaySwitch.setChecked(false);
+        LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        swLp.topMargin = dp(a, 8);
+        autoPlaySwitch.setLayoutParams(swLp);
+        autoPlaySwitch.setOnCheckedChangeListener(new CompoundButton.OnCheckedChangeListener() {
+            @Override public void onCheckedChanged(CompoundButton buttonView, boolean isChecked) {
+                if (switchSyncing) return;
+                if (isChecked) {
+                    doAutoPlayStart(a);
+                } else if (AutoPlay.isOn()) {
+                    AutoPlay.stop("Auto Play OFF — berhenti.");
+                }
+            }
         });
-        panel.addView(autoPlayBtn);
+        panel.addView(autoPlaySwitch);
 
         Button randomBtn = menuButton(a, "🎲  Buat World Acak");
         randomBtn.setOnClickListener(new View.OnClickListener() {
@@ -390,7 +415,7 @@ public final class Menu {
     }
 
     // ------------------------------------------------------------------
-    // v1.1 — Auto Play (toggle) & Buat World Acak
+    // v1.2 — Auto Play (Switch) & Buat World Acak
     // ------------------------------------------------------------------
 
     private static final AutoPlay.Listener autoPlayListener = new AutoPlay.Listener() {
@@ -399,23 +424,30 @@ public final class Menu {
         @Override public void onStateChanged(final boolean on) {
             UI.post(new Runnable() {
                 @Override public void run() {
-                    if (autoPlayBtn != null) {
-                        autoPlayBtn.setText(on
-                                ? "⏹  Auto Play — ON (ketuk untuk mati)"
-                                : "▶  Auto Play — OFF");
+                    if (autoPlaySwitch != null) {
+                        switchSyncing = true;
+                        autoPlaySwitch.setChecked(on);
+                        switchSyncing = false;
                     }
                 }
             });
         }
     };
 
-    private static void doAutoPlayToggle(final Activity a) {
+    /** Saklar Auto Play digeser ke ON. */
+    private static void doAutoPlayStart(final Activity a) {
         if (!NativeBridge.loaded) {
             setStatus("Auto Play tidak tersedia: payload native tidak termuat.");
-            return;
-        }
-        if (AutoPlay.isOn()) {
-            AutoPlay.stop("Auto Play OFF — berhenti.");
+            // Kembalikan saklar ke OFF (sinkron dengan keadaan sebenarnya).
+            UI.post(new Runnable() {
+                @Override public void run() {
+                    if (autoPlaySwitch != null) {
+                        switchSyncing = true;
+                        autoPlaySwitch.setChecked(false);
+                        switchSyncing = false;
+                    }
+                }
+            });
             return;
         }
         setStatus("Auto Play ON — solve level ini…");

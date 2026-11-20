@@ -3,7 +3,7 @@
 Mod menu **non-root** untuk game puzzle **Mekorama** (versi game **1.7.2**). Berbeda dari aplikasi injector, mod ini berbentuk **satu file APK game yang sudah dimodifikasi**: menu melayang berjalan di dalam proses game itu sendiri, lengkap dengan payload native kecil untuk fitur eksperimental. Tidak perlu root, tidak perlu aplikasi pendamping.
 
 [![Build](https://github.com/hozin-king/hozin-mekorama-mod/actions/workflows/build.yml/badge.svg)](https://github.com/hozin-king/hozin-mekorama-mod/actions/workflows/build.yml)
-![Versi Mod](https://img.shields.io/badge/versi%20mod-v1.1-orange)
+![Versi Mod](https://img.shields.io/badge/versi%20mod-v1.2-orange)
 ![Versi Game](https://img.shields.io/badge/game-Mekorama%201.7.2-blue)
 ![Root](https://img.shields.io/badge/root-tidak%20perlu-brightgreen)
 
@@ -16,8 +16,8 @@ Mod menu **non-root** untuk game puzzle **Mekorama** (versi game **1.7.2**). Ber
 | **Unlock Semua Level** | ✅ Stabil | Membuka seluruh 80 level Story dengan mengedit file save profil lokal (format zlib JSON bawaan game). Deterministik dan teruji otomatis di CI terhadap data game asli. |
 | **Pulihkan Save** | ✅ Stabil | Mengembalikan save asli dari backup yang dibuat otomatis sebelum edit pertama (`<save>.hozibak`). |
 | **Teleport ke Finish** | 🧪 Eksperimental | Payload native mencari badan robot & blok finish dari data level yang sedang dimuat, lalu memindahkan robot. Berbasis analisis statis + heuristik — **menunggu uji perangkat**, belum tentu bekerja di semua level. Laporan hasil selalu ditampilkan apa adanya di menu. |
-| **Auto Play — main sendiri** | ✅ Baru di v1.1 (toggle) | **TOGGLE ON/OFF.** Saat ON, solver A* memainkan level yang sedang dibuka sampai selesai, lalu **otomatis lanjut ke level berikut** sampai toggle dimatikan. Tanpa jeda buatan — robot jalan secepat game. Gagal 3x berturut-turut → toggle **mati sendiri** + alasan jelas. Batas jujur: hanya level yang bisa diselesaikan dengan jalan kaki (38 dari 144 level bawaan teruji solvable); level yang butuh geser blok / motor / bola / timing zapper **dilaporkan alasannya dan berhenti**, tidak dipaksa. |
-| **Buat World Acak** | ✅ Baru di v1.1 | Generator world (tapak ≤ 8×8, tinggi ≤ 4) yang **diverifikasi solver** sebelum disimpan, lalu ditulis ke sandbox game sehingga muncul sebagai **kartu level biasa + QR** (lewat `sandbox_write` milik game, sama seperti level hasil scan). Bila kartu belum muncul, ketuk "Muat Ulang Game". |
+| **Auto Play — main sendiri** | ✅ Baru di v1.2 (Switch) | **Switch Android asli berlabel "Auto Play"** — geser untuk ON/OFF, posisi saklar menunjukkan keadaannya. Saat ON, solver memainkan level yang sedang dibuka sampai selesai, lalu **otomatis lanjut ke level berikut** sampai saklar dimatikan. Solver kini bisa **geser blok (drag/slider)** — memindahkan blok tembaga & slider lewat fungsi game sendiri (`voxel_remove` + `voxel_add`) — dan **memutar kamera 90°** bila waypoint tertutup dari sudut sekarang + sesekali natural tiap ~10 langkah. Tanpa jeda buatan — robot jalan secepat game. Gagal 3x berturut-turut → saklar **mati sendiri** + alasan jelas. Teruji: **92 dari 144 level bawaan solvable** (49 murni jalan kaki, sisanya butuh geser blok); "Ride C Over Sea" (12 langkah + 4 geser, 19 ms) kini selesai. Level yang butuh motor / bola / kotak dorong / timing zapper **dilaporkan alasannya dan berhenti**, tidak dipaksa. |
+| **Buat World Acak** | ✅ Diperbaiki di v1.2 | Generator world (tapak ≤ 8×8, tinggi ≤ 4) yang **diverifikasi solver** sebelum disimpan, lalu ditulis ke sandbox game sehingga muncul sebagai **kartu level biasa + QR**. **Perbaikan v1.2:** format file world kini sesuai loader game (byte ekstra tiap sel ditulis berselip seperti level asli, bukan grid polos + ekor nol) — kartu ter-render (preview 3D muncul, author "Hozin"), dan **play dari kartu benar-benar menjalankan level sampai selesai**. Diuji host: 20/20 world lolos simulasi load game + solvable. |
 | Ketuk-untuk-Teleport | ⏸ Belum ada | Sengaja tidak dimasukkan di v1.0: dasar teleportnya belum terbukti cukup meyakinkan secara statis. |
 
 Yang **sengaja tidak** dimodifikasi: donasi *Pay What You Want* dan status bebas-iklan yang melekat padanya adalah gerbang pembayaran nyata milik developer — mod ini tidak menyentuhnya.
@@ -28,7 +28,7 @@ Yang **sengaja tidak** dimodifikasi: donasi *Pay What You Want* dan status bebas
 
 1. (Opsional) Cadangkan save lama bila ingin aman — walau begitu, meng-uninstall game asli akan menghapus save-nya.
 2. Uninstall **Mekorama** asli dari perangkat.
-3. Unduh `HozinMekoramaMod-v1.1.apk` dari halaman [Releases](../../releases).
+3. Unduh `HozinMekoramaMod-v1.2.apk` dari halaman [Releases](../../releases).
 4. Pasang APK-nya (izinkan "instal dari sumber tidak dikenal" bila diminta).
 5. Buka game — tombol melayang **MOD** muncul di sisi kiri layar.
 
@@ -38,7 +38,7 @@ Yang **sengaja tidak** dimodifikasi: donasi *Pay What You Want* dan status bebas
 - **🔓 Unlock Semua Level** — menulis ulang save profil: semua level Story terbuka. Game akan **ditutup paksa ±2 detik** setelahnya; ini disengaja agar save di memori game tidak menimpa hasil edit. Buka lagi game-nya dan semua level sudah terbuka.
 - **↩ Pulihkan Save Asli** — mengembalikan backup yang dibuat otomatis saat Unlock pertama kali.
 - **🌀 Teleport ke Finish (EKSPERIMENTAL)** — gunakan saat sudah masuk ke dalam level. Hasil percobaan (berhasil/gagal/alasannya) ditampilkan sebagai teks status di panel.
-- **▶ Auto Play — OFF/ON (toggle)** — masuk ke dalam level dulu, lalu ketuk untuk ON. Robot memainkan level itu sendiri sampai finish, lalu otomatis lanjut ke level berikut, terus sampai kamu ketuk lagi untuk OFF. Kalau level tidak bisa di-solve (mis. butuh geser blok / motor / bola / zapper), toggle **mati sendiri** dan status menjelaskan alasannya. Kalau robot macet 3x berturut-turut, toggle juga mati sendiri.
+- **Auto Play (Switch)** — masuk ke dalam level dulu, lalu geser saklar **Auto Play** ke ON. Robot memainkan level itu sendiri sampai finish (jalan + geser blok bila perlu, kamera berputar bila waypoint tertutup), lalu otomatis lanjut ke level berikut, terus sampai kamu geser lagi ke OFF. Kalau level tidak bisa di-solve (mis. butuh motor / bola / kotak dorong / zapper), saklar **mati sendiri** dan status menjelaskan alasannya. Kalau robot macet 3x berturut-turut, saklar juga mati sendiri.
 - **🎲 Buat World Acak** — membuat satu world baru ("Acak Hozin #n") yang sudah dicek solvable, lalu menyimpannya sebagai kartu level biasa lengkap dengan QR. Kembali ke daftar level untuk melihat kartunya; kalau belum muncul, ketuk **↻ Muat Ulang Game**.
 
 ## Kompatibilitas
