@@ -40,7 +40,7 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           else
-            echo "version=v1.0-dev" >> "$GITHUB_OUTPUT"
+            echo "version=v1.1-dev" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Install Android SDK packages
@@ -66,11 +66,22 @@ jobs:
         run: |
           mkdir -p /tmp/basefiles /tmp/test-classes
           unzip -o -q /tmp/base.apk 'assets/db' 'assets/level_infos.json' -d /tmp/basefiles
+          unzip -o -q /tmp/base.apk 'assets/x_*.bin' 'assets/f_*.bin' 'assets/w_*.bin' -d /tmp/basefiles
           javac -encoding UTF-8 -proc:none -d /tmp/test-classes \
             menu-src/com/hozinking/mekomod/SaveEditor.java \
             test/com/hozinking/mekomod/SaveEditorTest.java
           java -cp /tmp/test-classes com.hozinking.mekomod.SaveEditorTest \
             /tmp/basefiles/assets/db /tmp/basefiles/assets/level_infos.json
+
+      - name: Uji host Solver + WorldGen (Auto Play & world acak)
+        run: |
+          javac -encoding UTF-8 -proc:none -d /tmp/test-classes \
+            menu-src/com/hozinking/mekomod/LevelFormat.java \
+            menu-src/com/hozinking/mekomod/Solver.java \
+            menu-src/com/hozinking/mekomod/WorldGen.java \
+            test/com/hozinking/mekomod/SolverTest.java
+          java -cp /tmp/test-classes com.hozinking.mekomod.SolverTest \
+            /tmp/basefiles/assets
 
       - name: Build payload native (arm64-v8a + armeabi-v7a)
         run: |

@@ -37,6 +37,13 @@ import java.util.Map;
  *  2. Pulihkan Save — salin balik backup di atas.
  *  3. Teleport ke Finish — EKSPERIMENTAL (payload native, menunggu uji
  *     HP). Status hasil ditampilkan apa adanya.
+ *  4. Auto Play (v1.1) — TOGGLE ON/OFF: saat ON, solver A* memainkan
+ *     level yang sedang dibuka sampai selesai, lalu OTOMATIS lanjut ke
+ *     level berikut sampai toggle dimatikan. Gagal 3x berturut-turut ->
+ *     toggle mati sendiri + alasan jelas (lihat AutoPlay).
+ *  5. Buat World Acak (v1.1) — generator world yang diverifikasi solver,
+ *     ditulis ke sandbox game lewat sandbox_write milik game sehingga
+ *     muncul sebagai kartu level biasa + QR (lihat WorldGen).
  *
  * Semua jalur dibungkus try/catch: menu tidak boleh membuat game crash.
  */
@@ -44,11 +51,12 @@ public final class Menu {
     private Menu() {}
 
     private static final String TAG = "MEKOMOD";
-    public static final String VERSION = "1.0";
+    public static final String VERSION = "1.1";
 
     private static Activity activity;
     private static TextView statusView;
     private static LinearLayout panel;
+    private static Button autoPlayBtn;
     private static boolean nativeInitCalled = false;
     private static final Handler UI = new Handler(Looper.getMainLooper());
 
@@ -140,6 +148,31 @@ public final class Menu {
         });
         panel.addView(tpBtn);
 
+        autoPlayBtn = menuButton(a, "▶  Auto Play — OFF");
+        autoPlayBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { doAutoPlayToggle(a); }
+        });
+        panel.addView(autoPlayBtn);
+
+        Button randomBtn = menuButton(a, "🎲  Buat World Acak");
+        randomBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { doRandomWorld(a); }
+        });
+        panel.addView(randomBtn);
+
+        Button restartBtn = menuButton(a, "↻  Muat Ulang Game (biar kartu world muncul)");
+        restartBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                setStatus("Game dimuat ulang ±1,5 detik — buka lagi Mekorama-nya.");
+                UI.postDelayed(new Runnable() {
+                    @Override public void run() {
+                        android.os.Process.killProcess(android.os.Process.myPid());
+                    }
+                }, 1500);
+            }
+        });
+        panel.addView(restartBtn);
+
         statusView = new TextView(a);
         statusView.setTextColor(0xFFFFCC80);
         statusView.setTextSize(11);
@@ -147,7 +180,8 @@ public final class Menu {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         stLp.topMargin = dp(a, 8);
         statusView.setLayoutParams(stLp);
-        statusView.setText("Siap. Teleport masih eksperimental — menunggu uji HP.");
+        statusView.setText("Siap. Auto Play: masuk ke level lalu ON-kan toggle — "
+                + "robot main sendiri sampai toggle dimatikan.");
         panel.addView(statusView);
 
         Button closeBtn = menuButton(a, "Tutup Menu");
@@ -353,6 +387,122 @@ public final class Menu {
                 }
             }
         }, "mekomod-teleport").start();
+    }
+
+    // ------------------------------------------------------------------
+    // v1.1 — Auto Play (toggle) & Buat World Acak
+    // ------------------------------------------------------------------
+
+    private static final AutoPlay.Listener autoPlayListener = new AutoPlay.Listener() {
+        @Override public void onStatus(final String s) { setStatus(s); }
+
+        @Override public void onStateChanged(final boolean on) {
+            UI.post(new Runnable() {
+                @Override public void run() {
+                    if (autoPlayBtn != null) {
+                        autoPlayBtn.setText(on
+                                ? "⏹  Auto Play — ON (ketuk untuk mati)"
+                                : "▶  Auto Play — OFF");
+                    }
+                }
+            });
+        }
+    };
+
+    private static void doAutoPlayToggle(final Activity a) {
+        if (!NativeBridge.loaded) {
+            setStatus("Auto Play tidak tersedia: payload native tidak termuat.");
+            return;
+        }
+        if (AutoPlay.isOn()) {
+            AutoPlay.stop("Auto Play OFF — berhenti.");
+            return;
+        }
+        setStatus("Auto Play ON — solve level ini…");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    AutoPlay.start(a, autoPlayListener);
+                } catch (Throwable t) {
+                    Log.e(TAG, "autoplay gagal", t);
+                    setStatus("Auto Play GAGAL: " + t.getMessage());
+                }
+            }
+        }, "mekomod-autoplay-ui").start();
+    }
+
+    private static void doRandomWorld(final Activity a) {
+        if (!NativeBridge.loaded) {
+            setStatus("Buat World Acak tidak tersedia: payload native tidak termuat.");
+            return;
+        }
+        setStatus("Membuat world acak…");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    int number = nextRandomWorldNumber();
+                    WorldGen.World world = WorldGen.generate(
+                            new java.util.Random(), number);
+                    if (world == null) {
+                        setStatus("Buat World Acak GAGAL: 50x percobaan tidak "
+                                + "menghasilkan world yang lolos solver — coba lagi.");
+                        return;
+                    }
+                    final String fileName = "w_acak_hozin_" + number + ".bin";
+                    final byte[] bin = world.binBytes;
+                    final int[] rc = {-99};
+                    Boolean ok = AutoPlay.runOnUiAndWait(new Runnable() {
+                        @Override public void run() {
+                            rc[0] = NativeBridge.nativeWriteWorld(fileName, bin);
+                        }
+                    });
+                    if (ok == null || rc[0] != 0) {
+                        setStatus("Buat World Acak GAGAL: world '" + world.title
+                                + "' tidak bisa ditulis ke sandbox game (kode " + rc[0]
+                                + ") — coba lagi / restart game.");
+                        return;
+                    }
+                    setStatus("World '" + world.title + "' DIBUAT (" + world.pathSteps
+                            + " langkah, sudah dicek solvable).\n"
+                            + "Kembali ke daftar level — kartunya + QR muncul di sana. "
+                            + "Kalau belum kelihatan, ketuk \"Muat Ulang Game\" di bawah.");
+                } catch (Throwable t) {
+                    Log.e(TAG, "random world gagal", t);
+                    setStatus("Buat World Acak GAGAL: " + t.getMessage());
+                }
+            }
+        }, "mekomod-random").start();
+    }
+
+    /** Nomor world acak berikutnya (1 + jumlah w_acak_hozin_*.bin di sandbox). */
+    private static int nextRandomWorldNumber() {
+        try {
+            String probe = NativeBridge.nativeSandboxPath("w_acak_hozin_1.bin");
+            if (probe != null) {
+                File dir = new File(probe).getParentFile();
+                if (dir != null && dir.isDirectory()) {
+                    File[] files = dir.listFiles();
+                    int max = 0;
+                    if (files != null) {
+                        for (File f : files) {
+                            String n = f.getName();
+                            if (n.startsWith("w_acak_hozin_") && n.endsWith(".bin")) {
+                                try {
+                                    int v = Integer.parseInt(n.substring(
+                                            "w_acak_hozin_".length(), n.length() - 4));
+                                    if (v > max) max = v;
+                                } catch (NumberFormatException ignored) {
+                                }
+                            }
+                        }
+                    }
+                    return max + 1;
+                }
+            }
+        } catch (Throwable ignored) {
+            // jatuh ke fallback di bawah
+        }
+        return 1 + (int) (Math.random() * 99998);
     }
 
     /**
